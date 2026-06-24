@@ -19,7 +19,7 @@ class FusionLIIF(nn.Module):
 
     def __init__(self, encoder_spec, imnet_spec=None, metric_dim=32,
                  temperature=0.1, local_ensemble=True, feat_unfold=True,
-                 cell_decode=True, pretrained_liif=None):
+                 cell_decode=True, pretrained_liif=None, freeze_encoder=False):
         super().__init__()
         self.is_fusion_liif = True
         self.local_ensemble = local_ensemble
@@ -54,6 +54,14 @@ class FusionLIIF(nn.Module):
         self.last_modality_weight = None
         if pretrained_liif is not None:
             self.load_pretrained_liif(pretrained_liif)
+        if freeze_encoder:
+            self.freeze_encoders()
+
+    def freeze_encoders(self):
+        for encoder in [self.vi_encoder, self.ir_encoder]:
+            encoder.eval()
+            for p in encoder.parameters():
+                p.requires_grad = False
 
     def _adapt_encoder_sd(self, state_dict):
         enc_sd = {}
@@ -102,8 +110,15 @@ class FusionLIIF(nn.Module):
         vi = _gray_from_rgb(vi)
         ir = _gray_from_rgb(ir)
 
-        self.vi_feat = self.vi_encoder(vi)
-        self.ir_feat = self.ir_encoder(ir)
+        if not any(p.requires_grad for p in self.vi_encoder.parameters()):
+            self.vi_encoder.eval()
+            self.ir_encoder.eval()
+            with torch.no_grad():
+                self.vi_feat = self.vi_encoder(vi)
+                self.ir_feat = self.ir_encoder(ir)
+        else:
+            self.vi_feat = self.vi_encoder(vi)
+            self.ir_feat = self.ir_encoder(ir)
         self.vi_metric_feat = self.vi_metric(self.vi_feat)
         self.ir_metric_feat = self.ir_metric(self.ir_feat)
         return self.vi_feat, self.ir_feat

@@ -85,3 +85,18 @@ class PairedImageFolders(Dataset):
 
     def __getitem__(self, idx):
         return self.dataset_1[idx], self.dataset_2[idx]
+
+
+@register('triple-image-folders')
+class TripleImageFolders(Dataset):
+
+    def __init__(self, root_path_1, root_path_2, root_path_3, **kwargs):
+        self.dataset_1 = ImageFolder(root_path_1, **kwargs)
+        self.dataset_2 = ImageFolder(root_path_2, **kwargs)
+        self.dataset_3 = ImageFolder(root_path_3, **kwargs)
+
+    def __len__(self):
+        return min(len(self.dataset_1), len(self.dataset_2), len(self.dataset_3))
+
+    def __getitem__(self, idx):
+        return self.dataset_1[idx], self.dataset_2[idx], self.dataset_3[idx]
