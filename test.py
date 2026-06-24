@@ -13,9 +13,50 @@ import models
 import utils
 
 
-def batched_predict(model, inp, coord, cell, bsize):
+def is_fusion_model(model):
+    return getattr(model, 'is_fusion_liif', False)
+
+
+def to_gray_image(x):
+    if x.shape[1] == 1:
+        return x
+    weight = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    return (x[:, :3] * weight).sum(dim=1, keepdim=True)
+
+
+def to_gray_query(x):
+    if x.shape[-1] == 1:
+        return x
+    weight = x.new_tensor([0.299, 0.587, 0.114]).view(1, 1, 3)
+    return (x[..., :3] * weight).sum(dim=-1, keepdim=True)
+
+
+def get_first(batch, names):
+    for name in names:
+        if name in batch:
+            return batch[name]
+    return None
+
+
+def make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div):
+    vi = get_first(batch, ['vi', 'vis', 'img_vi', 'img_vis'])
+    ir = get_first(batch, ['ir', 'img_ir'])
+    if vi is None:
+        vi = batch['inp']
+    if ir is None:
+        ir = vi
+    vi = (to_gray_image(vi) - inp_sub) / inp_div
+    ir = (to_gray_image(ir) - inp_sub) / inp_div
+    gt = (to_gray_query(batch['gt']) - gt_sub) / gt_div
+    return vi, ir, gt
+
+
+def batched_predict(model, inp, coord, cell, bsize, ir=None):
     with torch.no_grad():
-        model.gen_feat(inp)
+        if is_fusion_model(model):
+            model.gen_feat(inp, ir)
+        else:
+            model.gen_feat(inp)
         n = coord.shape[1]
         ql = 0
         preds = []
@@ -62,13 +103,23 @@ def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
         for k, v in batch.items():
             batch[k] = v.cuda()
 
-        inp = (batch['inp'] - inp_sub) / inp_div
-        if eval_bsize is None:
-            with torch.no_grad():
-                pred = model(inp, batch['coord'], batch['cell'])
+        if is_fusion_model(model):
+            inp, ir, gt = make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div)
+            if eval_bsize is None:
+                with torch.no_grad():
+                    pred = model(inp, ir, batch['coord'], batch['cell'])
+            else:
+                pred = batched_predict(model, inp,
+                    batch['coord'], batch['cell'], eval_bsize, ir=ir)
         else:
-            pred = batched_predict(model, inp,
-                batch['coord'], batch['cell'], eval_bsize)
+            inp = (batch['inp'] - inp_sub) / inp_div
+            if eval_bsize is None:
+                with torch.no_grad():
+                    pred = model(inp, batch['coord'], batch['cell'])
+            else:
+                pred = batched_predict(model, inp,
+                    batch['coord'], batch['cell'], eval_bsize)
+            gt = (batch['gt'] - gt_sub) / gt_div
         pred = pred * gt_div + gt_sub
         pred.clamp_(0, 1)
 
@@ -81,7 +132,8 @@ def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
             batch['gt'] = batch['gt'].view(*shape) \
                 .permute(0, 3, 1, 2).contiguous()
 
-        res = metric_fn(pred, batch['gt'])
+        target = gt * gt_div + gt_sub if is_fusion_model(model) else batch['gt']
+        res = metric_fn(pred, target)
         val_res.add(res.item(), inp.shape[0])
 
         if verbose:

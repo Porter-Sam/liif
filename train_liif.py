@@ -27,6 +27,8 @@ import os
 import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import MultiStepLR
@@ -86,6 +88,156 @@ def prepare_training():
     return model, optimizer, epoch_start, lr_scheduler
 
 
+def is_fusion_model(model):
+    model_ = model.module if isinstance(model, nn.DataParallel) else model
+    return getattr(model_, 'is_fusion_liif', False)
+
+
+def to_gray_image(x):
+    if x.shape[1] == 1:
+        return x
+    weight = x.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    return (x[:, :3] * weight).sum(dim=1, keepdim=True)
+
+
+def to_gray_query(x):
+    if x.shape[-1] == 1:
+        return x
+    weight = x.new_tensor([0.299, 0.587, 0.114]).view(1, 1, 3)
+    return (x[..., :3] * weight).sum(dim=-1, keepdim=True)
+
+
+def get_first(batch, names):
+    for name in names:
+        if name in batch:
+            return batch[name]
+    return None
+
+
+def make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div):
+    vi = get_first(batch, ['vi', 'vis', 'img_vi', 'img_vis'])
+    ir = get_first(batch, ['ir', 'img_ir'])
+    if vi is None:
+        vi = batch['inp']
+    if ir is None:
+        ir = vi
+
+    vi = (to_gray_image(vi) - inp_sub) / inp_div
+    ir = (to_gray_image(ir) - inp_sub) / inp_div
+    gt = (to_gray_query(batch['gt']) - gt_sub) / gt_div
+    return vi, ir, gt
+
+
+def _tensor_to_pil(img):
+    img = img.detach().float().cpu().clamp(0, 1)
+    if img.dim() == 3:
+        if img.shape[0] == 1:
+            img = img.expand(3, -1, -1)
+        img = img.permute(1, 2, 0)
+    arr = (img.numpy() * 255.0).round().astype('uint8')
+    return Image.fromarray(arr)
+
+
+def _panel(img, label):
+    pil = _tensor_to_pil(img)
+    label_h = 18
+    canvas = Image.new('RGB', (pil.width, pil.height + label_h), color=(255, 255, 255))
+    canvas.paste(pil.convert('RGB'), (0, label_h))
+    draw = ImageDraw.Draw(canvas)
+    draw.text((4, 2), label, fill=(0, 0, 0))
+    return canvas
+
+
+def _save_visual_row(path, panels):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pil_panels = [_panel(img, label) for label, img in panels]
+    width = sum(p.width for p in pil_panels)
+    height = max(p.height for p in pil_panels)
+    canvas = Image.new('RGB', (width, height), color=(255, 255, 255))
+    x = 0
+    for panel in pil_panels:
+        canvas.paste(panel, (x, 0))
+        x += panel.width
+    canvas.save(path)
+
+
+def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
+    if loader is None or not is_fusion_model(model):
+        return
+
+    model.eval()
+    data_norm = config['data_norm']
+    t = data_norm['inp']
+    inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
+    inp_div = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
+    t = data_norm['gt']
+    gt_sub_img = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
+    gt_div_img = torch.FloatTensor(t['div']).view(1, -1, 1, 1).cuda()
+
+    batch = next(iter(loader))
+    for k, v in batch.items():
+        batch[k] = v.cuda()
+
+    vi_raw = get_first(batch, ['vi', 'vis', 'img_vi', 'img_vis'])
+    ir_raw = get_first(batch, ['ir', 'img_ir'])
+    if vi_raw is None:
+        vi_raw = batch['inp']
+    if ir_raw is None:
+        ir_raw = vi_raw
+
+    vi_show = to_gray_image(vi_raw[:1]).clamp(0, 1)
+    ir_show = to_gray_image(ir_raw[:1]).clamp(0, 1)
+    vi = (vi_show - inp_sub) / inp_div
+    ir = (ir_show - inp_sub) / inp_div
+
+    if 'gt_img' in batch:
+        gt_img = to_gray_image(batch['gt_img'][:1]).clamp(0, 1)
+    else:
+        h = round(batch['coord'].shape[1] ** 0.5)
+        gt_img = to_gray_query(batch['gt'][:1]).view(1, h, h, 1).permute(0, 3, 1, 2).clamp(0, 1)
+
+    h, w = gt_img.shape[-2:]
+    coord = utils.make_coord((h, w)).cuda().unsqueeze(0)
+    cell = torch.ones_like(coord)
+    cell[:, :, 0] *= 2 / h
+    cell[:, :, 1] *= 2 / w
+
+    preds = []
+    distances = []
+    with torch.no_grad():
+        model.gen_feat(vi, ir)
+        ql = 0
+        while ql < coord.shape[1]:
+            qr = min(ql + bsize, coord.shape[1])
+            pred = model.query_rgb(coord[:, ql:qr], cell[:, ql:qr])
+            preds.append(pred)
+            distances.append(model.last_modality_distance)
+            ql = qr
+
+    pred = torch.cat(preds, dim=1)
+    pred = pred * gt_div_img.view(1, 1, -1) + gt_sub_img.view(1, 1, -1)
+    pred_img = pred.view(1, h, w, -1).permute(0, 3, 1, 2).clamp(0, 1)
+
+    dist = torch.cat(distances, dim=1)
+    dist_map = (dist[..., 1] - dist[..., 0]).view(1, 1, h, w)
+    dist_min = dist_map.amin(dim=(-2, -1), keepdim=True)
+    dist_max = dist_map.amax(dim=(-2, -1), keepdim=True)
+    dist_map = (dist_map - dist_min) / (dist_max - dist_min + 1e-6)
+
+    vi_show = F.interpolate(vi_show, size=(h, w), mode='bilinear', align_corners=False)
+    ir_show = F.interpolate(ir_show, size=(h, w), mode='bilinear', align_corners=False)
+
+    out_path = os.path.join(save_path, 'visual', 'epoch-{:06d}.png'.format(epoch))
+    _save_visual_row(out_path, [
+        ('IR', ir_show[0]),
+        ('VI', vi_show[0]),
+        ('Distance', dist_map[0]),
+        ('Pred', pred_img[0]),
+        ('GT', gt_img[0]),
+    ])
+    log('visual saved: {}'.format(out_path))
+
+
 def train(train_loader, model, optimizer):
     model.train()
     loss_fn = nn.L1Loss()
@@ -98,15 +250,19 @@ def train(train_loader, model, optimizer):
     t = data_norm['gt']
     gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
     gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
+    fusion_mode = is_fusion_model(model)
 
     for batch in tqdm(train_loader, leave=False, desc='train'):
         for k, v in batch.items():
             batch[k] = v.cuda()
 
-        inp = (batch['inp'] - inp_sub) / inp_div
-        pred = model(inp, batch['coord'], batch['cell'])
-
-        gt = (batch['gt'] - gt_sub) / gt_div
+        if fusion_mode:
+            vi, ir, gt = make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div)
+            pred = model(vi, ir, batch['coord'], batch['cell'])
+        else:
+            inp = (batch['inp'] - inp_sub) / inp_div
+            pred = model(inp, batch['coord'], batch['cell'])
+            gt = (batch['gt'] - gt_sub) / gt_div
         loss = loss_fn(pred, gt)
 
         train_loss.add(loss.item())
@@ -189,6 +345,10 @@ def main(config_, save_path):
                 data_norm=config['data_norm'],
                 eval_type=config.get('eval_type'),
                 eval_bsize=config.get('eval_bsize'))
+            if config.get('vis_val', is_fusion_model(model_)):
+                save_fusion_visualization(
+                    val_loader, model_, save_path, epoch,
+                    bsize=config.get('vis_bsize', config.get('eval_bsize', 65536)))
 
             log_info.append('val: psnr={:.4f}'.format(val_res))
             writer.add_scalars('psnr', {'val': val_res}, epoch)

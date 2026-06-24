@@ -75,7 +75,8 @@ class SRImplicitPaired(Dataset):
             'inp': crop_lr,
             'coord': hr_coord,
             'cell': cell,
-            'gt': hr_rgb
+            'gt': hr_rgb,
+            'gt_img': crop_hr
         }
 
 
@@ -153,7 +154,8 @@ class SRImplicitDownsampled(Dataset):
             'inp': crop_lr,
             'coord': hr_coord,
             'cell': cell,
-            'gt': hr_rgb
+            'gt': hr_rgb,
+            'gt_img': crop_hr
         }
 
 
@@ -204,5 +206,6 @@ class SRImplicitUniformVaried(Dataset):
             'inp': img_lr,
             'coord': hr_coord,
             'cell': cell,
-            'gt': hr_rgb
+            'gt': hr_rgb,
+            'gt_img': img_hr
         }
