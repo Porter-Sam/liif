@@ -120,6 +120,17 @@ def crop_with_params(img, x0, y0, size):
     return img[:, x0:x0 + size, y0:y0 + size]
 
 
+def center_crop_square_resize(img, size):
+    h, w = img.shape[-2:]
+    side = min(h, w)
+    x0 = (h - side) // 2
+    y0 = (w - side) // 2
+    crop = img[:, x0:x0 + side, y0:y0 + side]
+    if side == size:
+        return crop
+    return resize_fn(crop, (size, size))
+
+
 @register('sr-implicit-downsampled')
 class SRImplicitDownsampled(Dataset):
 
@@ -197,13 +208,15 @@ class SRImplicitDownsampled(Dataset):
 class FusionImplicitPaired(Dataset):
 
     def __init__(self, dataset, inp_size=128, out_size=256,
-                 augment=False, sample_q=None, target_mode='avg'):
+                 augment=False, sample_q=None, target_mode='avg',
+                 crop_mode='resize_crop'):
         self.dataset = dataset
         self.inp_size = inp_size
         self.out_size = out_size
         self.augment = augment
         self.sample_q = sample_q
         self.target_mode = target_mode
+        self.crop_mode = crop_mode
 
     def __len__(self):
         return len(self.dataset)
@@ -235,26 +248,34 @@ class FusionImplicitPaired(Dataset):
         ir = to_gray_tensor(ir)
         gt = to_gray_tensor(gt) if gt is not None else None
 
-        vi = resize_short_side_at_least(vi, self.out_size)
-        ir = resize_short_side_at_least(ir, self.out_size)
-        if gt is not None:
-            gt = resize_short_side_at_least(gt, self.out_size)
-
-        h = min(vi.shape[-2], ir.shape[-2], gt.shape[-2] if gt is not None else vi.shape[-2])
-        w = min(vi.shape[-1], ir.shape[-1], gt.shape[-1] if gt is not None else vi.shape[-1])
-        if self.augment:
-            x0 = random.randint(0, h - self.out_size)
-            y0 = random.randint(0, w - self.out_size)
+        if self.crop_mode == 'center_resize':
+            vi_hr = center_crop_square_resize(vi, self.out_size)
+            ir_hr = center_crop_square_resize(ir, self.out_size)
+            if gt is not None:
+                gt_hr = center_crop_square_resize(gt, self.out_size)
+            else:
+                gt_hr = self._make_target(vi_hr, ir_hr)
         else:
-            x0 = (h - self.out_size) // 2
-            y0 = (w - self.out_size) // 2
+            vi = resize_short_side_at_least(vi, self.out_size)
+            ir = resize_short_side_at_least(ir, self.out_size)
+            if gt is not None:
+                gt = resize_short_side_at_least(gt, self.out_size)
 
-        vi_hr = crop_with_params(vi, x0, y0, self.out_size)
-        ir_hr = crop_with_params(ir, x0, y0, self.out_size)
-        if gt is not None:
-            gt_hr = crop_with_params(gt, x0, y0, self.out_size)
-        else:
-            gt_hr = self._make_target(vi_hr, ir_hr)
+            h = min(vi.shape[-2], ir.shape[-2], gt.shape[-2] if gt is not None else vi.shape[-2])
+            w = min(vi.shape[-1], ir.shape[-1], gt.shape[-1] if gt is not None else vi.shape[-1])
+            if self.augment:
+                x0 = random.randint(0, h - self.out_size)
+                y0 = random.randint(0, w - self.out_size)
+            else:
+                x0 = (h - self.out_size) // 2
+                y0 = (w - self.out_size) // 2
+
+            vi_hr = crop_with_params(vi, x0, y0, self.out_size)
+            ir_hr = crop_with_params(ir, x0, y0, self.out_size)
+            if gt is not None:
+                gt_hr = crop_with_params(gt, x0, y0, self.out_size)
+            else:
+                gt_hr = self._make_target(vi_hr, ir_hr)
 
         if self.augment:
             hflip = random.random() < 0.5
