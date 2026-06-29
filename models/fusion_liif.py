@@ -26,6 +26,7 @@ class FusionLIIF(nn.Module):
         self.feat_unfold = feat_unfold
         self.cell_decode = cell_decode
         self.temperature = temperature
+        self.sample_mode = 'nearest'
         self.last_modality_distance = None
 
         self.vi_encoder = models.make(encoder_spec)
@@ -126,7 +127,7 @@ class FusionLIIF(nn.Module):
     def _sample(self, feat, coord):
         return F.grid_sample(
             feat, coord.flip(-1).unsqueeze(1),
-            mode='nearest', align_corners=False)[:, :, 0, :].permute(0, 2, 1)
+            mode=self.sample_mode, align_corners=False)[:, :, 0, :].permute(0, 2, 1)
 
     def query_rgb(self, coord, cell=None):
         vi_feat = self.vi_feat

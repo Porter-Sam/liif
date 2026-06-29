@@ -93,6 +93,11 @@ def is_fusion_model(model):
     return getattr(model_, 'is_fusion_liif', False)
 
 
+def is_pixel_fusion_model(model):
+    model_ = model.module if isinstance(model, nn.DataParallel) else model
+    return getattr(model_, 'is_pixel_fusion', False)
+
+
 def to_gray_image(x):
     if x.shape[1] == 1:
         return x
@@ -126,6 +131,59 @@ def make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div):
     ir = (to_gray_image(ir) - inp_sub) / inp_div
     gt = (to_gray_query(batch['gt']) - gt_sub) / gt_div
     return vi, ir, gt
+
+
+def make_pixel_fusion_inputs(batch):
+    vi = get_first(batch, ['vi', 'vis', 'img_vi', 'img_vis'])
+    ir = get_first(batch, ['ir', 'img_ir'])
+    if vi is None:
+        vi = batch['inp']
+    if ir is None:
+        ir = vi
+    gt = batch['gt_img']
+    return to_gray_image(vi).clamp(0, 1), to_gray_image(ir).clamp(0, 1), to_gray_image(gt).clamp(0, 1)
+
+
+def image_grad(x):
+    grad_x = x[:, :, :, 1:] - x[:, :, :, :-1]
+    grad_y = x[:, :, 1:, :] - x[:, :, :-1, :]
+    grad_x = F.pad(grad_x.abs(), (0, 1, 0, 0))
+    grad_y = F.pad(grad_y.abs(), (0, 0, 0, 1))
+    return grad_x + grad_y
+
+
+def fusion_loss(pred, vi, ir, int_weight=1.0, grad_weight=1.0):
+    target_int = torch.maximum(vi, ir)
+    target_grad = torch.maximum(image_grad(vi), image_grad(ir))
+    loss_int = F.l1_loss(pred, target_int)
+    loss_grad = F.l1_loss(image_grad(pred), target_grad)
+    return int_weight * loss_int + grad_weight * loss_grad
+
+
+def distance_tv_loss(d):
+    loss_h = (d[:, :, 1:, :] - d[:, :, :-1, :]).abs().mean()
+    loss_w = (d[:, :, :, 1:] - d[:, :, :, :-1]).abs().mean()
+    return loss_h + loss_w
+
+
+def distance_soft_loss(d, eps):
+    return (F.relu(eps - d) + F.relu(d - (1.0 - eps))).mean()
+
+
+def distance_entropy(d, eps=1e-6):
+    d = d.clamp(eps, 1.0 - eps)
+    return -(d * torch.log(d) + (1.0 - d) * torch.log(1.0 - d)).mean()
+
+
+def apply_pixel_runtime_config(model):
+    model_ = model.module if isinstance(model, nn.DataParallel) else model
+    if not getattr(model_, 'is_pixel_fusion', False):
+        return
+    model_args = config.get('model', {}).get('args', {})
+    if 'temperature' in model_args:
+        model_.temperature = float(model_args['temperature'])
+    if 'residual_scale' in model_args:
+        model_.residual_scale = float(model_args['residual_scale'])
 
 
 def _tensor_to_pil(img):
@@ -162,10 +220,32 @@ def _save_visual_row(path, panels):
 
 
 def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
-    if loader is None or not is_fusion_model(model):
+    if loader is None or (not is_fusion_model(model) and not is_pixel_fusion_model(model)):
         return
 
     model.eval()
+    if is_pixel_fusion_model(model):
+        batch = next(iter(loader))
+        for k, v in batch.items():
+            batch[k] = v.cuda()
+        vi, ir, gt_img = make_pixel_fusion_inputs(batch)
+        with torch.no_grad():
+            pred_img = model(vi[:1], ir[:1]).clamp(0, 1)
+        model_ = model.module if isinstance(model, nn.DataParallel) else model
+        d_vi = model_.last_d_vi[:1].clamp(0, 1)
+        d_ir = model_.last_d_ir[:1].clamp(0, 1)
+        out_path = os.path.join(save_path, 'visual', 'epoch-{:06d}.png'.format(epoch))
+        _save_visual_row(out_path, [
+            ('VI', vi[:1][0]),
+            ('IR', ir[:1][0]),
+            ('d_vi', d_vi[0]),
+            ('d_ir', d_ir[0]),
+            ('Pred', pred_img[0]),
+            ('GT', gt_img[:1][0]),
+        ])
+        log('visual saved: {}'.format(out_path))
+        return
+
     data_norm = config['data_norm']
     t = data_norm['inp']
     inp_sub = torch.FloatTensor(t['sub']).view(1, -1, 1, 1).cuda()
@@ -251,19 +331,47 @@ def train(train_loader, model, optimizer):
     gt_sub = torch.FloatTensor(t['sub']).view(1, 1, -1).cuda()
     gt_div = torch.FloatTensor(t['div']).view(1, 1, -1).cuda()
     fusion_mode = is_fusion_model(model)
+    pixel_fusion_mode = is_pixel_fusion_model(model)
+    loss_tv_weight = config.get('loss_tv_weight', 0.02)
+    loss_soft_weight = config.get('loss_soft_weight', 0.01)
+    loss_entropy_weight = config.get('loss_entropy_weight', 0.0)
+    fusion_int_weight = config.get('fusion_int_weight', 1.0)
+    fusion_grad_weight = config.get('fusion_grad_weight', 1.0)
+    pixel_loss_mode = config.get('pixel_loss_mode', 'supervised')
+    distance_eps = config.get('distance_eps', 0.03)
+    apply_pixel_runtime_config(model)
 
     for batch in tqdm(train_loader, leave=False, desc='train'):
         for k, v in batch.items():
             batch[k] = v.cuda()
 
-        if fusion_mode:
+        if pixel_fusion_mode:
+            vi, ir, gt_img = make_pixel_fusion_inputs(batch)
+            pred = model(vi, ir)
+            model_ = model.module if isinstance(model, nn.DataParallel) else model
+            d_ir = model_.last_d_ir
+            if pixel_loss_mode == 'fusion':
+                loss_rec = fusion_loss(pred, vi, ir, fusion_int_weight, fusion_grad_weight)
+            else:
+                loss_rec = loss_fn(pred, gt_img)
+            loss_tv = distance_tv_loss(d_ir)
+            loss_soft = distance_soft_loss(d_ir, distance_eps)
+            entropy = distance_entropy(d_ir)
+            loss = (
+                loss_rec
+                + loss_tv_weight * loss_tv
+                + loss_soft_weight * loss_soft
+                - loss_entropy_weight * entropy
+            )
+        elif fusion_mode:
             vi, ir, gt = make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div)
             pred = model(vi, ir, batch['coord'], batch['cell'])
+            loss = loss_fn(pred, gt)
         else:
             inp = (batch['inp'] - inp_sub) / inp_div
             pred = model(inp, batch['coord'], batch['cell'])
             gt = (batch['gt'] - gt_sub) / gt_div
-        loss = loss_fn(pred, gt)
+            loss = loss_fn(pred, gt)
 
         train_loss.add(loss.item())
 

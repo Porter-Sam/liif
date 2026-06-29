@@ -1,0 +1,78 @@
+train_dataset:
+  dataset:
+    name: triple-image-folders
+    args:
+      root_path_1: E:/YuShihang/project/thermal_residual_synthesis/outputs/msrs_train/visible
+      root_path_2: E:/YuShihang/project/thermal_residual_synthesis/outputs/msrs_train/pseudo_ir_ideal
+      root_path_3: E:/YuShihang/project/thermal_residual_synthesis/outputs/msrs_train/pseudo_fusion
+      repeat: 1
+      cache: none
+  wrapper:
+    name: fusion-implicit-paired
+    args:
+      inp_size: 128
+      out_size: 256
+      crop_mode: center_resize
+      augment: false
+      sample_q: 8192
+      target_mode: avg
+  batch_size: 4
+
+val_dataset:
+  dataset:
+    name: triple-image-folders
+    args:
+      root_path_1: E:/YuShihang/project/thermal_residual_synthesis/outputs/msrs_train/visible
+      root_path_2: E:/YuShihang/project/thermal_residual_synthesis/outputs/msrs_train/pseudo_ir_ideal
+      root_path_3: E:/YuShihang/project/thermal_residual_synthesis/outputs/msrs_train/pseudo_fusion
+      first_k: 20
+      repeat: 1
+      cache: none
+  wrapper:
+    name: fusion-implicit-paired
+    args:
+      inp_size: 128
+      out_size: 256
+      crop_mode: center_resize
+      augment: false
+      sample_q: 8192
+      target_mode: avg
+  batch_size: 4
+
+data_norm:
+  inp: {sub: [0.5], div: [0.5]}
+  gt: {sub: [0.5], div: [0.5]}
+
+model:
+  name: fusion-liif
+  args:
+    encoder_spec:
+      name: edsr-baseline
+      args:
+        no_upsampling: true
+        n_colors: 1
+    imnet_spec:
+      name: mlp
+      args:
+        out_dim: 1
+        hidden_list: [256, 256, 256, 256]
+    metric_dim: 32
+    temperature: 0.1
+    pretrained_liif: ./edsr-baseline-liif.pth
+    freeze_encoder: true
+
+optimizer:
+  name: adam
+  args:
+    lr: 1.e-4
+resume: ./save/msrs_synth_fusion_liif_gray_x2_e5/epoch-last.pth
+epoch_max: 100
+multi_step_lr:
+  milestones: [50, 80]
+  gamma: 0.5
+
+epoch_val: 5
+epoch_save: 10
+eval_bsize: 65536
+vis_val: true
+vis_bsize: 65536

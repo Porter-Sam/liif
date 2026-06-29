@@ -320,6 +320,96 @@ class FusionImplicitPaired(Dataset):
         }
 
 
+@register('fusion-pixel-paired')
+class FusionPixelPaired(Dataset):
+
+    def __init__(self, dataset, image_size=256, augment=False,
+                 target_mode='avg', crop_mode='center_resize'):
+        self.dataset = dataset
+        self.image_size = image_size
+        self.augment = augment
+        self.target_mode = target_mode
+        self.crop_mode = crop_mode
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _make_target(self, vi, ir):
+        if self.target_mode == 'vi':
+            return vi
+        if self.target_mode == 'ir':
+            return ir
+        if self.target_mode == 'max':
+            return torch.maximum(vi, ir)
+        if self.target_mode == 'avg':
+            return 0.5 * (vi + ir)
+        raise ValueError('Unknown target_mode: {}'.format(self.target_mode))
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        if not isinstance(item, (tuple, list)):
+            raise TypeError('fusion-pixel-paired expects paired or triple image dataset.')
+        if len(item) == 2:
+            vi, ir = item
+            gt = None
+        elif len(item) == 3:
+            vi, ir, gt = item
+        else:
+            raise ValueError('Expected dataset item length 2 or 3, got {}'.format(len(item)))
+
+        vi = to_gray_tensor(vi)
+        ir = to_gray_tensor(ir)
+        gt = to_gray_tensor(gt) if gt is not None else None
+
+        if self.crop_mode == 'center_resize':
+            vi_img = center_crop_square_resize(vi, self.image_size)
+            ir_img = center_crop_square_resize(ir, self.image_size)
+            gt_img = center_crop_square_resize(gt, self.image_size) if gt is not None else self._make_target(vi_img, ir_img)
+        else:
+            vi = resize_short_side_at_least(vi, self.image_size)
+            ir = resize_short_side_at_least(ir, self.image_size)
+            if gt is not None:
+                gt = resize_short_side_at_least(gt, self.image_size)
+
+            h = min(vi.shape[-2], ir.shape[-2], gt.shape[-2] if gt is not None else vi.shape[-2])
+            w = min(vi.shape[-1], ir.shape[-1], gt.shape[-1] if gt is not None else vi.shape[-1])
+            if self.augment:
+                x0 = random.randint(0, h - self.image_size)
+                y0 = random.randint(0, w - self.image_size)
+            else:
+                x0 = (h - self.image_size) // 2
+                y0 = (w - self.image_size) // 2
+
+            vi_img = crop_with_params(vi, x0, y0, self.image_size)
+            ir_img = crop_with_params(ir, x0, y0, self.image_size)
+            gt_img = crop_with_params(gt, x0, y0, self.image_size) if gt is not None else self._make_target(vi_img, ir_img)
+
+        if self.augment:
+            hflip = random.random() < 0.5
+            vflip = random.random() < 0.5
+            dflip = random.random() < 0.5
+
+            def augment(x):
+                if hflip:
+                    x = x.flip(-2)
+                if vflip:
+                    x = x.flip(-1)
+                if dflip:
+                    x = x.transpose(-2, -1)
+                return x
+
+            vi_img = augment(vi_img)
+            ir_img = augment(ir_img)
+            gt_img = augment(gt_img)
+
+        return {
+            'inp': vi_img,
+            'vi': vi_img,
+            'ir': ir_img,
+            'gt_img': gt_img,
+        }
+
+
 @register('sr-implicit-uniform-varied')
 class SRImplicitUniformVaried(Dataset):
 

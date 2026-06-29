@@ -1,0 +1,77 @@
+train_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: E:/dataset/msrs/train/vi_color
+      root_path_2: E:/dataset/msrs/train/ir
+      repeat: 1
+      cache: none
+  wrapper:
+    name: fusion-pixel-paired
+    args:
+      image_size: 256
+      crop_mode: center_resize
+      augment: false
+      target_mode: avg
+  batch_size: 4
+
+val_dataset:
+  dataset:
+    name: paired-image-folders
+    args:
+      root_path_1: E:/dataset/msrs/test/vi_color
+      root_path_2: E:/dataset/msrs/test/ir
+      first_k: 20
+      repeat: 1
+      cache: none
+  wrapper:
+    name: fusion-pixel-paired
+    args:
+      image_size: 256
+      crop_mode: center_resize
+      augment: false
+      target_mode: avg
+  batch_size: 4
+
+data_norm:
+  inp: {sub: [0.5], div: [0.5]}
+  gt: {sub: [0.5], div: [0.5]}
+
+model:
+  name: fusion-pixel-soft-distance
+  args:
+    encoder_spec:
+      name: edsr-baseline
+      args:
+        no_upsampling: true
+        n_colors: 1
+    hidden_dim: 64
+    temperature: 2.0
+    residual_scale: 0.25
+    pretrained_liif: ./edsr-baseline-liif.pth
+    freeze_encoder: true
+
+optimizer:
+  name: adam
+  args:
+    lr: 1.e-4
+
+pixel_loss_mode: fusion
+fusion_int_weight: 1.0
+fusion_grad_weight: 1.0
+loss_tv_weight: 0.02
+loss_soft_weight: 0.0
+loss_entropy_weight: 0.01
+distance_eps: 0.03
+
+epoch_max: 1000
+multi_step_lr:
+  milestones: [500, 800]
+  gamma: 0.5
+
+epoch_val: 5
+epoch_save: 10
+eval_bsize: null
+vis_val: true
+
+resume: ./save/msrs_synth_fusion_pixel_softdist_gray_256_e1000/epoch-last.pth
