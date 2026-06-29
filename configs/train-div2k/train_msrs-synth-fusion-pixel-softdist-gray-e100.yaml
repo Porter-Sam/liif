@@ -71,3 +71,4 @@ epoch_val: 5
 epoch_save: 10
 eval_bsize: null
 vis_val: true
+vis_num: 10

@@ -219,31 +219,67 @@ def _save_visual_row(path, panels):
     canvas.save(path)
 
 
+def _make_visual_row(panels):
+    pil_panels = [_panel(img, label) for label, img in panels]
+    width = sum(p.width for p in pil_panels)
+    height = max(p.height for p in pil_panels)
+    canvas = Image.new('RGB', (width, height), color=(255, 255, 255))
+    x = 0
+    for panel in pil_panels:
+        canvas.paste(panel, (x, 0))
+        x += panel.width
+    return canvas
+
+
+def _save_visual_grid(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    row_imgs = [_make_visual_row(row) for row in rows]
+    width = max(row.width for row in row_imgs)
+    height = sum(row.height for row in row_imgs)
+    canvas = Image.new('RGB', (width, height), color=(255, 255, 255))
+    y = 0
+    for row in row_imgs:
+        canvas.paste(row, (0, y))
+        y += row.height
+    canvas.save(path)
+
+
 def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
     if loader is None or (not is_fusion_model(model) and not is_pixel_fusion_model(model)):
         return
 
     model.eval()
     if is_pixel_fusion_model(model):
-        batch = next(iter(loader))
-        for k, v in batch.items():
-            batch[k] = v.cuda()
-        vi, ir, gt_img = make_pixel_fusion_inputs(batch)
-        with torch.no_grad():
-            pred_img = model(vi[:1], ir[:1]).clamp(0, 1)
+        max_images = config.get('vis_num', 10)
+        saved = 0
+        rows = []
         model_ = model.module if isinstance(model, nn.DataParallel) else model
-        d_vi = model_.last_d_vi[:1].clamp(0, 1)
-        d_ir = model_.last_d_ir[:1].clamp(0, 1)
+        with torch.no_grad():
+            for batch in loader:
+                for k, v in batch.items():
+                    batch[k] = v.cuda()
+                vi, ir, gt_img = make_pixel_fusion_inputs(batch)
+                pred_img = model(vi, ir).clamp(0, 1)
+                d_vi = model_.last_d_vi.clamp(0, 1)
+                d_ir = model_.last_d_ir.clamp(0, 1)
+
+                for i in range(vi.shape[0]):
+                    if saved >= max_images:
+                        break
+                    rows.append([
+                        ('VI', vi[i]),
+                        ('IR', ir[i]),
+                        ('d_vi', d_vi[i]),
+                        ('d_ir', d_ir[i]),
+                        ('Pred', pred_img[i]),
+                        ('GT', gt_img[i]),
+                    ])
+                    saved += 1
+                if saved >= max_images:
+                    break
         out_path = os.path.join(save_path, 'visual', 'epoch-{:06d}.png'.format(epoch))
-        _save_visual_row(out_path, [
-            ('VI', vi[:1][0]),
-            ('IR', ir[:1][0]),
-            ('d_vi', d_vi[0]),
-            ('d_ir', d_ir[0]),
-            ('Pred', pred_img[0]),
-            ('GT', gt_img[:1][0]),
-        ])
-        log('visual saved: {}'.format(out_path))
+        _save_visual_grid(out_path, rows)
+        log('visual saved: {} images in {}'.format(saved, out_path))
         return
 
     data_norm = config['data_norm']
