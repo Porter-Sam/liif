@@ -66,8 +66,12 @@ def prepare_training():
     if config.get('resume') is not None:
         sv_file = torch.load(config['resume'])
         model = models.make(sv_file['model'], load_sd=True).cuda()
-        optimizer = utils.make_optimizer(
-            model.parameters(), sv_file['optimizer'], load_sd=True)
+        if config.get('resume_model_only', False):
+            optimizer = utils.make_optimizer(
+                model.parameters(), config['optimizer'])
+        else:
+            optimizer = utils.make_optimizer(
+                model.parameters(), sv_file['optimizer'], load_sd=True)
         epoch_start = sv_file['epoch'] + 1
         if config.get('multi_step_lr') is None:
             lr_scheduler = None
@@ -176,6 +180,16 @@ def distance_entropy(d, eps=1e-6):
     return -(d * torch.log(d) + (1.0 - d) * torch.log(1.0 - d)).mean()
 
 
+def glare_reliability_loss(w_vi, vi, ir, threshold=0.85, delta=0.12,
+                           sharpness=20.0, ir_info_threshold=0.04):
+    glare = (
+        torch.sigmoid(sharpness * (vi - threshold))
+        * torch.sigmoid(sharpness * (vi - ir - delta))
+    )
+    ir_info = torch.sigmoid(sharpness * ((ir + image_grad(ir)) - ir_info_threshold))
+    return (glare * ir_info * w_vi).mean()
+
+
 def apply_pixel_runtime_config(model):
     model_ = model.module if isinstance(model, nn.DataParallel) else model
     if not getattr(model_, 'is_pixel_fusion', False):
@@ -185,6 +199,16 @@ def apply_pixel_runtime_config(model):
         model_.temperature = float(model_args['temperature'])
     if 'residual_scale' in model_args:
         model_.residual_scale = float(model_args['residual_scale'])
+    if 'reliability_temperature' in model_args:
+        model_.reliability_temperature = float(model_args['reliability_temperature'])
+    if 'glare_threshold' in model_args:
+        model_.glare_threshold = float(model_args['glare_threshold'])
+    if 'glare_delta' in model_args:
+        model_.glare_delta = float(model_args['glare_delta'])
+    if 'glare_sharpness' in model_args:
+        model_.glare_sharpness = float(model_args['glare_sharpness'])
+    if 'use_reliability' in model_args:
+        model_.use_reliability = bool(model_args['use_reliability'])
 
 
 def _tensor_to_pil(img):
@@ -263,6 +287,10 @@ def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
                 pred_img = model(vi, ir).clamp(0, 1)
                 d_vi = model_.last_d_vi.clamp(0, 1)
                 d_ir = model_.last_d_ir.clamp(0, 1)
+                r_vi = model_.last_r_vi.clamp(0, 1)
+                r_ir = model_.last_r_ir.clamp(0, 1)
+                w_vi = model_.last_w_vi.clamp(0, 1)
+                w_ir = model_.last_w_ir.clamp(0, 1)
 
                 for i in range(vi.shape[0]):
                     if saved >= max_images:
@@ -272,6 +300,10 @@ def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
                         ('IR', ir[i]),
                         ('d_vi', d_vi[i]),
                         ('d_ir', d_ir[i]),
+                        ('r_vi', r_vi[i]),
+                        ('r_ir', r_ir[i]),
+                        ('w_vi', w_vi[i]),
+                        ('w_ir', w_ir[i]),
                         ('Pred', pred_img[i]),
                         ('GT', gt_img[i]),
                     ])
@@ -372,10 +404,15 @@ def train(train_loader, model, optimizer):
     loss_tv_weight = config.get('loss_tv_weight', 0.02)
     loss_soft_weight = config.get('loss_soft_weight', 0.01)
     loss_entropy_weight = config.get('loss_entropy_weight', 0.0)
+    loss_glare_rel_weight = config.get('loss_glare_rel_weight', 0.0)
     fusion_int_weight = config.get('fusion_int_weight', 1.0)
     fusion_grad_weight = config.get('fusion_grad_weight', 1.0)
     pixel_loss_mode = config.get('pixel_loss_mode', 'supervised')
     distance_eps = config.get('distance_eps', 0.03)
+    glare_threshold = config.get('glare_threshold', 0.85)
+    glare_delta = config.get('glare_delta', 0.12)
+    glare_sharpness = config.get('glare_sharpness', 20.0)
+    ir_info_threshold = config.get('ir_info_threshold', 0.04)
     apply_pixel_runtime_config(model)
 
     for batch in tqdm(train_loader, leave=False, desc='train'):
@@ -387,6 +424,7 @@ def train(train_loader, model, optimizer):
             pred = model(vi, ir)
             model_ = model.module if isinstance(model, nn.DataParallel) else model
             d_ir = model_.last_d_ir
+            w_vi = model_.last_w_vi
             if pixel_loss_mode == 'fusion':
                 loss_rec = fusion_loss(pred, vi, ir, fusion_int_weight, fusion_grad_weight)
             else:
@@ -394,11 +432,18 @@ def train(train_loader, model, optimizer):
             loss_tv = distance_tv_loss(d_ir)
             loss_soft = distance_soft_loss(d_ir, distance_eps)
             entropy = distance_entropy(d_ir)
+            loss_glare_rel = glare_reliability_loss(
+                w_vi, vi, ir,
+                threshold=glare_threshold,
+                delta=glare_delta,
+                sharpness=glare_sharpness,
+                ir_info_threshold=ir_info_threshold)
             loss = (
                 loss_rec
                 + loss_tv_weight * loss_tv
                 + loss_soft_weight * loss_soft
                 - loss_entropy_weight * entropy
+                + loss_glare_rel_weight * loss_glare_rel
             )
         elif fusion_mode:
             vi, ir, gt = make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div)

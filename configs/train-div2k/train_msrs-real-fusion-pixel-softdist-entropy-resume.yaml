@@ -47,7 +47,12 @@ model:
         n_colors: 1
     hidden_dim: 64
     temperature: 2.0
+    reliability_temperature: 1.0
     residual_scale: 0.25
+    glare_threshold: 0.85
+    glare_delta: 0.12
+    glare_sharpness: 20.0
+    use_reliability: true
     pretrained_liif: ./edsr-baseline-liif.pth
     freeze_encoder: true
 
@@ -62,7 +67,12 @@ fusion_grad_weight: 1.0
 loss_tv_weight: 0.02
 loss_soft_weight: 0.0
 loss_entropy_weight: 0.01
+loss_glare_rel_weight: 0.2
 distance_eps: 0.03
+glare_threshold: 0.85
+glare_delta: 0.12
+glare_sharpness: 20.0
+ir_info_threshold: 0.04
 
 epoch_max: 1000
 multi_step_lr:
@@ -73,5 +83,7 @@ epoch_val: 5
 epoch_save: 10
 eval_bsize: null
 vis_val: true
+vis_num: 10
 
-resume: ./save/msrs_synth_fusion_pixel_softdist_gray_256_e1000/epoch-last.pth
+resume: ./save/msrs_real_fusion_pixel_softdist_entropy_from_epoch103_e1000/epoch-last.pth
+resume_model_only: true

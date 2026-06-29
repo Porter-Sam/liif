@@ -50,7 +50,12 @@ model:
         n_colors: 1
     hidden_dim: 64
     temperature: 0.7
+    reliability_temperature: 1.0
     residual_scale: 0.25
+    glare_threshold: 0.85
+    glare_delta: 0.12
+    glare_sharpness: 20.0
+    use_reliability: true
     pretrained_liif: ./edsr-baseline-liif.pth
     freeze_encoder: true
 
@@ -61,7 +66,12 @@ optimizer:
 
 loss_tv_weight: 0.02
 loss_soft_weight: 0.01
+loss_glare_rel_weight: 0.0
 distance_eps: 0.03
+glare_threshold: 0.85
+glare_delta: 0.12
+glare_sharpness: 20.0
+ir_info_threshold: 0.04
 
 epoch_max: 1
 epoch_val: 1
