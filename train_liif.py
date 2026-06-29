@@ -23,6 +23,7 @@
 
 import argparse
 import os
+from datetime import datetime
 
 import yaml
 import torch
@@ -516,6 +517,8 @@ if __name__ == '__main__':
     parser.add_argument('--name', default=None)
     parser.add_argument('--tag', default=None)
     parser.add_argument('--gpu', default='0')
+    parser.add_argument('--no_timestamp', action='store_true',
+                        help='Disable timestamp suffix in save directory name.')
     args = parser.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -529,6 +532,8 @@ if __name__ == '__main__':
         save_name = '_' + args.config.split('/')[-1][:-len('.yaml')]
     if args.tag is not None:
         save_name += '_' + args.tag
+    if not args.no_timestamp:
+        save_name += '_' + datetime.now().strftime('%Y%m%d-%H%M%S')
     save_path = os.path.join('./save', save_name)
 
     main(config, save_path)
