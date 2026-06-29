@@ -2,8 +2,8 @@ train_dataset:
   dataset:
     name: paired-image-folders
     args:
-      root_path_1: E:/dataset/msrs/train/vi_color
-      root_path_2: E:/dataset/msrs/train/ir
+      root_path_1: /datasdb/wl/dataset/msrs/train/vi_color
+      root_path_2: /datasdb/wl/dataset/msrs/train/ir
       repeat: 1
       cache: none
   wrapper:
@@ -13,14 +13,14 @@ train_dataset:
       crop_mode: center_resize
       augment: false
       target_mode: avg
-  batch_size: 4
+  batch_size: 32
 
 val_dataset:
   dataset:
     name: paired-image-folders
     args:
-      root_path_1: E:/dataset/msrs/test/vi_color
-      root_path_2: E:/dataset/msrs/test/ir
+      root_path_1: /datasdb/wl/dataset/msrs/val/vi_color
+      root_path_2: /datasdb/wl/dataset/msrs/val/ir
       first_k: 20
       repeat: 1
       cache: none
@@ -85,5 +85,5 @@ eval_bsize: null
 vis_val: true
 vis_num: 10
 
-resume: ./save/msrs_real_fusion_pixel_softdist_entropy_from_epoch103_e1000/epoch-last.pth
+#resume: ./save/msrs_real_fusion_pixel_softdist_entropy_from_epoch103_e1000/epoch-last.pth
 resume_model_only: true
