@@ -51,8 +51,10 @@ def make_data_loader(spec, tag=''):
     for k, v in dataset[0].items():
         log('  {}: shape={}'.format(k, tuple(v.shape)))
 
+    num_workers = spec.get('num_workers', config.get('num_workers', 8))
     loader = DataLoader(dataset, batch_size=spec['batch_size'],
-        shuffle=(tag == 'train'), num_workers=8, pin_memory=True)
+        shuffle=(tag == 'train'), num_workers=num_workers, pin_memory=True,
+        persistent_workers=(num_workers > 0))
     return loader
 
 
@@ -146,7 +148,13 @@ def make_pixel_fusion_inputs(batch):
     if ir is None:
         ir = vi
     gt = batch['gt_img']
-    return to_gray_image(vi).clamp(0, 1), to_gray_image(ir).clamp(0, 1), to_gray_image(gt).clamp(0, 1)
+    depth = batch.get('depth', None)
+    vi = to_gray_image(vi).clamp(0, 1)
+    ir = to_gray_image(ir).clamp(0, 1)
+    gt = to_gray_image(gt).clamp(0, 1)
+    if depth is not None:
+        depth = to_gray_image(depth).clamp(0, 1)
+    return vi, ir, gt, depth
 
 
 def image_grad(x):
@@ -188,6 +196,32 @@ def glare_reliability_loss(w_vi, vi, ir, threshold=0.85, delta=0.12,
     )
     ir_info = torch.sigmoid(sharpness * ((ir + image_grad(ir)) - ir_info_threshold))
     return (glare * ir_info * w_vi).mean()
+
+
+def normalize_depth_batch(depth):
+    if depth is None:
+        return None
+    d_min = depth.amin(dim=(-2, -1), keepdim=True)
+    d_max = depth.amax(dim=(-2, -1), keepdim=True)
+    return (depth - d_min) / (d_max - d_min + 1e-6)
+
+
+def depth_aware_smooth_loss(w_ir, depth, alpha=10.0, ir=None, ir_gamma=0.0):
+    if depth is None:
+        return w_ir.new_tensor(0.0)
+    depth = normalize_depth_batch(depth)
+    dx_w = (w_ir[:, :, :, 1:] - w_ir[:, :, :, :-1]).abs()
+    dy_w = (w_ir[:, :, 1:, :] - w_ir[:, :, :-1, :]).abs()
+    dx_d = (depth[:, :, :, 1:] - depth[:, :, :, :-1]).abs()
+    dy_d = (depth[:, :, 1:, :] - depth[:, :, :-1, :]).abs()
+    weight_x = torch.exp(-alpha * dx_d)
+    weight_y = torch.exp(-alpha * dy_d)
+    if ir is not None and ir_gamma > 0:
+        ir_x = 0.5 * (ir[:, :, :, 1:] + ir[:, :, :, :-1])
+        ir_y = 0.5 * (ir[:, :, 1:, :] + ir[:, :, :-1, :])
+        weight_x = weight_x * torch.exp(-ir_gamma * ir_x)
+        weight_y = weight_y * torch.exp(-ir_gamma * ir_y)
+    return (weight_x * dx_w).mean() + (weight_y * dy_w).mean()
 
 
 def apply_pixel_runtime_config(model):
@@ -283,8 +317,8 @@ def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
             for batch in loader:
                 for k, v in batch.items():
                     batch[k] = v.cuda()
-                vi, ir, gt_img = make_pixel_fusion_inputs(batch)
-                pred_img = model(vi, ir).clamp(0, 1)
+                vi, ir, gt_img, depth = make_pixel_fusion_inputs(batch)
+                pred_img = model(vi, ir, depth).clamp(0, 1)
                 d_vi = model_.last_d_vi.clamp(0, 1)
                 d_ir = model_.last_d_ir.clamp(0, 1)
                 r_vi = model_.last_r_vi.clamp(0, 1)
@@ -298,6 +332,7 @@ def save_fusion_visualization(loader, model, save_path, epoch, bsize=65536):
                     rows.append([
                         ('VI', vi[i]),
                         ('IR', ir[i]),
+                        ('Depth', depth[i] if depth is not None else torch.zeros_like(ir[i])),
                         ('d_vi', d_vi[i]),
                         ('d_ir', d_ir[i]),
                         ('r_vi', r_vi[i]),
@@ -405,6 +440,9 @@ def train(train_loader, model, optimizer):
     loss_soft_weight = config.get('loss_soft_weight', 0.01)
     loss_entropy_weight = config.get('loss_entropy_weight', 0.0)
     loss_glare_rel_weight = config.get('loss_glare_rel_weight', 0.0)
+    loss_depth_smooth_weight = config.get('loss_depth_smooth_weight', 0.0)
+    depth_edge_alpha = config.get('depth_edge_alpha', 10.0)
+    depth_ir_gamma = config.get('depth_ir_gamma', 0.0)
     fusion_int_weight = config.get('fusion_int_weight', 1.0)
     fusion_grad_weight = config.get('fusion_grad_weight', 1.0)
     pixel_loss_mode = config.get('pixel_loss_mode', 'supervised')
@@ -420,8 +458,8 @@ def train(train_loader, model, optimizer):
             batch[k] = v.cuda()
 
         if pixel_fusion_mode:
-            vi, ir, gt_img = make_pixel_fusion_inputs(batch)
-            pred = model(vi, ir)
+            vi, ir, gt_img, depth = make_pixel_fusion_inputs(batch)
+            pred = model(vi, ir, depth)
             model_ = model.module if isinstance(model, nn.DataParallel) else model
             d_ir = model_.last_d_ir
             w_vi = model_.last_w_vi
@@ -438,12 +476,18 @@ def train(train_loader, model, optimizer):
                 delta=glare_delta,
                 sharpness=glare_sharpness,
                 ir_info_threshold=ir_info_threshold)
+            w_ir = model_.last_w_ir
+            loss_depth_smooth = (
+                depth_aware_smooth_loss(w_ir, depth, alpha=depth_edge_alpha, ir=ir, ir_gamma=depth_ir_gamma)
+                + depth_aware_smooth_loss(d_ir, depth, alpha=depth_edge_alpha, ir=ir, ir_gamma=depth_ir_gamma)
+            )
             loss = (
                 loss_rec
                 + loss_tv_weight * loss_tv
                 + loss_soft_weight * loss_soft
                 - loss_entropy_weight * entropy
                 + loss_glare_rel_weight * loss_glare_rel
+                + loss_depth_smooth_weight * loss_depth_smooth
             )
         elif fusion_mode:
             vi, ir, gt = make_fusion_inputs(batch, inp_sub, inp_div, gt_sub, gt_div)

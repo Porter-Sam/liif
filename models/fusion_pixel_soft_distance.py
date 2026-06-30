@@ -96,14 +96,14 @@ class FusionPixelSoftDistance(nn.Module):
         self.ir_encoder = models.make(encoder_spec)
         self.out_dim = self.vi_encoder.out_dim
 
-        dist_in_dim = self.out_dim * 3 + 3
+        dist_in_dim = self.out_dim * 3 + 5
         self.distance_net = nn.Sequential(
             ConvBlock(dist_in_dim, hidden_dim),
             nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, 1),
         )
-        rel_in_dim = 9
+        rel_in_dim = 11
         self.reliability_net = ReliabilityNet(rel_in_dim, hidden_dim)
         self.decoder = nn.Sequential(
             ConvBlock(self.out_dim, hidden_dim),
@@ -166,9 +166,16 @@ class FusionPixelSoftDistance(nn.Module):
             f_ir = self.ir_encoder(ir)
         return f_vi, f_ir
 
-    def forward(self, vi, ir):
+    def forward(self, vi, ir, depth=None):
         vi = _gray_from_rgb(vi).clamp(0, 1)
         ir = _gray_from_rgb(ir).clamp(0, 1)
+        if depth is None:
+            depth = torch.zeros_like(vi)
+        else:
+            depth = _gray_from_rgb(depth).clamp(0, 1)
+            if depth.shape[-2:] != vi.shape[-2:]:
+                depth = F.interpolate(depth, size=vi.shape[-2:], mode='bilinear', align_corners=False)
+        depth_grad = _grad_mag(depth).clamp(0, 1)
 
         f_vi, f_ir = self._encode(vi, ir)
         if f_vi.shape[-2:] != vi.shape[-2:]:
@@ -176,7 +183,7 @@ class FusionPixelSoftDistance(nn.Module):
             f_ir = F.interpolate(f_ir, size=ir.shape[-2:], mode='bilinear', align_corners=False)
 
         dist_inp = torch.cat([f_vi, f_ir, (f_vi - f_ir).abs(),
-                              vi, ir, (vi - ir).abs()], dim=1)
+                              vi, ir, (vi - ir).abs(), depth, depth_grad], dim=1)
         d_ir = torch.sigmoid(self.distance_net(dist_inp) / max(self.temperature, 1e-6))
         d_vi = 1.0 - d_ir
 
@@ -188,23 +195,25 @@ class FusionPixelSoftDistance(nn.Module):
             torch.sigmoid(self.glare_sharpness * (vi - self.glare_threshold))
             * torch.sigmoid(self.glare_sharpness * (vi - ir - self.glare_delta))
         )
-        rel_inp = torch.cat([
-            vi, ir, (vi - ir).abs(),
-            vi_grad, ir_grad,
-            vi_contrast, ir_contrast,
-            glare, glare * (ir + ir_grad + ir_contrast).clamp(0, 1),
-        ], dim=1)
-        reliability = self.reliability_net(rel_inp / max(self.reliability_temperature, 1e-6))
-        r_vi = reliability[:, :1]
-        r_ir = reliability[:, 1:]
-
         if self.use_reliability:
+            rel_inp = torch.cat([
+                vi, ir, (vi - ir).abs(),
+                vi_grad, ir_grad,
+                vi_contrast, ir_contrast,
+                glare, glare * (ir + ir_grad + ir_contrast).clamp(0, 1),
+                depth, depth_grad,
+            ], dim=1)
+            reliability = self.reliability_net(rel_inp / max(self.reliability_temperature, 1e-6))
+            r_vi = reliability[:, :1]
+            r_ir = reliability[:, 1:]
             w_vi_raw = d_vi * r_vi
             w_ir_raw = d_ir * r_ir
             denom = w_vi_raw + w_ir_raw + 1e-6
             w_vi = w_vi_raw / denom
             w_ir = w_ir_raw / denom
         else:
+            r_vi = torch.full_like(d_vi, 0.5)
+            r_ir = torch.full_like(d_ir, 0.5)
             w_vi = d_vi
             w_ir = d_ir
 
@@ -213,13 +222,13 @@ class FusionPixelSoftDistance(nn.Module):
         residual = self.residual_scale * torch.tanh(self.decoder(f_fuse))
         pred = torch.clamp(base + residual, 0, 1)
 
-        self.last_d_ir = d_ir.detach()
-        self.last_d_vi = d_vi.detach()
-        self.last_r_ir = r_ir.detach()
-        self.last_r_vi = r_vi.detach()
-        self.last_w_ir = w_ir.detach()
-        self.last_w_vi = w_vi.detach()
-        self.last_glare = glare.detach()
-        self.last_base = base.detach()
-        self.last_residual = residual.detach()
+        self.last_d_ir = d_ir
+        self.last_d_vi = d_vi
+        self.last_r_ir = r_ir
+        self.last_r_vi = r_vi
+        self.last_w_ir = w_ir
+        self.last_w_vi = w_vi
+        self.last_glare = glare
+        self.last_base = base
+        self.last_residual = residual
         return pred
